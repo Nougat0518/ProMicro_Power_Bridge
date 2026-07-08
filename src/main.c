@@ -972,6 +972,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	} else {
 		ble_periph_connected = false;
 		ble_adv_active = false;
+		cps_notify_enabled = false;
+		csc_notify_enabled = false;
 		/* 手机 APP 断开后必须立即恢复可连接广播，否则 APP 无法再次连接。 */
 		(void)start_advertising();
 	}
