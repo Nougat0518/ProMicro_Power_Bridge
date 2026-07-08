@@ -1,0 +1,17 @@
+﻿sample:
+  description: XDS BLE to ANT+ and BLE Cycling Power bridge
+  name: ProMicro_Power_Bridge
+common:
+  min_ram: 64
+  min_flash: 384
+  tags: bluetooth ant cycling power
+  integration_platforms:
+    - promicro_nrf52840/nrf52840/uf2
+  harness: console
+  harness_config:
+    type: one_line
+    regex:
+      - "Bridge running: BLE\\(XDS\\) -> ANT \\+ BLE\\(CPS\\)"
+tests:
+  sample.promicro_power_bridge:
+    tags: bluetooth ant cycling power

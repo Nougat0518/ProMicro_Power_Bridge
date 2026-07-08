@@ -1,0 +1,20 @@
+softdevice:
+  address: 0x00000000
+  end_address: 0x00026000
+  region: flash_primary
+  size: 0x00026000
+app:
+  address: 0x00026000
+  end_address: 0x000ec000
+  region: flash_primary
+  size: 0x000c6000
+storage:
+  address: 0x000ec000
+  end_address: 0x000f4000
+  region: flash_primary
+  size: 0x00008000
+uf2_bootloader:
+  address: 0x000f4000
+  end_address: 0x00100000
+  region: flash_primary
+  size: 0x0000c000
