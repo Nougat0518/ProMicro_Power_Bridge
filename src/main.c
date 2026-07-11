@@ -54,6 +54,10 @@ LOG_MODULE_REGISTER(xds_ant_bridge, LOG_LEVEL_INF);
 /* Scan in bursts so central scanning does not starve advertising/ANT in busy areas. */
 #define XDS_SCAN_ON_MS 5000
 #define XDS_SCAN_OFF_MS 1000
+/** @brief 未通过 GATT 验证的地址暂停重试时间（ms）。 */
+#define XDS_REJECT_RETRY_MS 30000
+/** @brief ANT RX 活动多久后不再显示码表在线（ms）。 */
+#define ANT_DISPLAY_ACTIVITY_TIMEOUT_MS 10000
 
 /** @brief XDS 功率计服务 UUID（16-bit）。 */
 #define XDS_SERVICE_UUID_16 0x1828
@@ -112,6 +116,13 @@ static struct bt_uuid_16 discover_uuid;
 static uint16_t service_start_handle;
 /** @brief 目标服务结束句柄。 */
 static uint16_t service_end_handle;
+/** @brief 已通过完整 GATT 验证的 XDS 地址（本次上电期间绑定）。 */
+static bt_addr_le_t validated_sensor_addr;
+static bool validated_sensor_addr_valid;
+/** @brief 最近未通过 GATT 验证的地址及其退避起点。 */
+static bt_addr_le_t rejected_sensor_addr;
+static bool rejected_sensor_addr_valid;
+static uint32_t rejected_sensor_at_ms;
 
 /** @brief BLE 数据共享锁（通知回调与主循环共享）。 */
 static struct k_mutex data_lock;
@@ -146,18 +157,24 @@ static const struct bt_gatt_attr *csc_meas_attr;
 static bool ble_seen_sensor;
 /** @brief 是否已连接 XDS 设备。 */
 static bool ble_connected_sensor;
+/** @brief XDS 测量特征已成功订阅，可以使用本连接的数据。 */
+static bool ble_sensor_ready;
 /** @brief 是否有手机 APP 连接到本机外设。 */
 static bool ble_periph_connected;
 static bool ble_adv_active;
 static bool xds_scan_active;
 /** @brief 是否检测到 ANT 码表已链路建立。 */
 static bool ant_linked_display;
+/** @brief 最近一次收到 ANT 对端消息的时间。 */
+static uint32_t last_ant_rx_ms;
 /** @brief 累计曲柄转数（供 CPS/CSCS）。 */
 static uint32_t cumulative_crank_revs;
 /** @brief 上次曲柄事件时间（1/1024s，16-bit 回卷）。 */
 static uint16_t last_crank_event_time_1024;
 /** @brief 曲柄更新参考时间戳（ms）。 */
 static uint32_t last_crank_update_ms;
+/** @brief 上一次曲柄状态是否为转动。 */
+static bool crank_was_moving;
 /** @brief 上次向 APP 发送通知时间戳（ms）。 */
 static uint32_t last_app_notify_ms;
 /** @brief 上次 APP 转发日志时间戳（ms）。 */
@@ -222,6 +239,32 @@ static ssize_t read_csc_feature(struct bt_conn *conn, const struct bt_gatt_attr 
 static bool cps_any_subscribed(void);
 static bool csc_any_subscribed(void);
 
+struct subscription_check {
+	const struct bt_gatt_attr *attr;
+	bool subscribed;
+};
+
+static void check_connection_subscription(struct bt_conn *conn, void *user_data)
+{
+	struct subscription_check *check = user_data;
+
+	if (!check->subscribed &&
+	    bt_gatt_is_subscribed(conn, check->attr, BT_GATT_CCC_NOTIFY)) {
+		check->subscribed = true;
+	}
+}
+
+static bool any_connection_subscribed(const struct bt_gatt_attr *attr)
+{
+	struct subscription_check check = {
+		.attr = attr,
+		.subscribed = false,
+	};
+
+	bt_conn_foreach(BT_CONN_TYPE_LE, check_connection_subscription, &check);
+	return check.subscribed;
+}
+
 BT_GATT_SERVICE_DEFINE(cps_svc,
 	BT_GATT_PRIMARY_SERVICE(BT_UUID_CPS),
 	/* Measurement 按规范使用 Notify，避免客户端因可读属性判定为非标准实现。 */
@@ -249,7 +292,7 @@ static bool cps_any_subscribed(void)
 	if (cps_meas_attr == NULL) {
 		cps_meas_attr = &cps_svc.attrs[CPS_MEAS_ATTR_IDX];
 	}
-	return bt_gatt_is_subscribed(NULL, cps_meas_attr, BT_GATT_CCC_NOTIFY);
+	return any_connection_subscribed(cps_meas_attr);
 }
 
 /** @brief 是否有任一外设连接订阅了 CSCS 通知。 */
@@ -258,7 +301,7 @@ static bool csc_any_subscribed(void)
 	if (csc_meas_attr == NULL) {
 		csc_meas_attr = &csc_svc.attrs[CSC_MEAS_ATTR_IDX];
 	}
-	return bt_gatt_is_subscribed(NULL, csc_meas_attr, BT_GATT_CCC_NOTIFY);
+	return any_connection_subscribed(csc_meas_attr);
 }
 
 /**
@@ -274,14 +317,15 @@ static void update_crank_metrics(uint16_t cadence_rpm, uint32_t now_ms)
 	uint16_t time_inc_1024;
 
 	if (cadence_rpm == 0U) {
-		/* 停脚：重置参考时间，避免恢复踩踏时把整个停脚期当成连续转圈，
-		 * 导致 cumulative_crank_revs 一次补上几十圈、瞬时踏频飙到几百 rpm。 */
+		/* 停脚后令下一次非零样本只建立时间基准，不补算停脚期。 */
 		last_crank_update_ms = now_ms;
+		crank_was_moving = false;
 		return;
 	}
 
-	if (last_crank_update_ms == 0U) {
+	if (!crank_was_moving || last_crank_update_ms == 0U) {
 		last_crank_update_ms = now_ms;
+		crank_was_moving = true;
 		return;
 	}
 
@@ -291,10 +335,6 @@ static void update_crank_metrics(uint16_t cadence_rpm, uint32_t now_ms)
 	}
 
 	elapsed = now_ms - last_crank_update_ms;
-	/* 双保险：恢复踩踏首包若 elapsed 异常偏大(停脚期未清干净)，最多补 1 圈。 */
-	if (elapsed > per_rev_ms * 2U) {
-		elapsed = per_rev_ms;
-	}
 	if (elapsed < per_rev_ms) {
 		return;
 	}
@@ -352,7 +392,7 @@ static size_t build_csc_measurement(uint16_t cadence_rpm, uint8_t out[5])
 
 /* 订阅状态由 Zephyr 按 per-connection 维护，无需手写标志位；
  * notify 用 bt_gatt_notify(NULL,...) 广播给所有已开 CCC 的连接，
- * 是否有人订阅统一查 bt_gatt_is_subscribed(NULL,...)。
+ * 是否有人订阅通过 bt_conn_foreach() 对每个有效连接检查。
  */
 static void cps_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
@@ -413,7 +453,7 @@ static void notify_ble_apps_from_cache(void)
 	}
 
 	k_mutex_lock(&data_lock, K_FOREVER);
-	use_live_data = ble_connected_sensor && ((now - last_ble_data_ms) < DATA_TIMEOUT_MS);
+	use_live_data = ble_sensor_ready && ((now - last_ble_data_ms) < DATA_TIMEOUT_MS);
 	pwr = use_live_data ? latest_power_w : 0U;
 	cad = use_live_data ? latest_cadence : 0U;
 	k_mutex_unlock(&data_lock);
@@ -424,7 +464,7 @@ static void notify_ble_apps_from_cache(void)
 		any_notified = true;
 	}
 
-	if (!ant_linked_display && csc_sub) {
+	if (csc_sub) {
 		uint8_t csc[5];
 		size_t csc_len = build_csc_measurement(cad, csc);
 
@@ -474,7 +514,7 @@ static void maintain_ble_links(void)
 {
 	uint32_t now = k_uptime_get_32();
 
-	if (!ble_periph_connected &&
+	if (periph_conn_count < CONFIG_BT_CTLR_SDC_PERIPHERAL_COUNT &&
 	    (!ble_adv_active || (now - last_adv_watchdog_ms) >= APP_ADV_WATCHDOG_MS)) {
 		last_adv_watchdog_ms = now;
 		(void)start_advertising();
@@ -672,7 +712,15 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
 	ARG_UNUSED(conn);
 	ARG_UNUSED(params);
 
-	if (!data || length < 11) {
+	if (!data) {
+		ble_sensor_ready = false;
+		LOG_WRN("XDS notification subscription was removed; reconnecting");
+		if (conn != NULL) {
+			(void)bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		}
+		return BT_GATT_ITER_STOP;
+	}
+	if (length < 11) {
 		return BT_GATT_ITER_CONTINUE;
 	}
 
@@ -689,10 +737,8 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
 	now = k_uptime_get_32();
 	if (raw_cadence_s8 >= 0 && raw_cadence_s8 <= 200) {
 		cadence_calc = (uint16_t)raw_cadence_s8;
-	} else if (raw_cadence_u8 <= 200U) {
-		/* 某些固件版本以无符号 byte6 上报踏频。 */
-		cadence_calc = (uint16_t)raw_cadence_u8;
 	} else {
+		/* XDS 协议定义 byte6 为有符号值；负值表示反踩，不得回退成高踏频。 */
 		cadence_calc = 0U;
 	}
 
@@ -707,23 +753,15 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
 		uint32_t delta = now - last_rx_packet_ms;
 
 		if (delta > 0U && delta < DATA_TIMEOUT_MS) {
-			/* Accumulated Power 单位是焦耳(W·s)：功率(W) × 间隔(s)。
-			 * 旧实现误乘 4(只在 4Hz/250ms 事件周期假设下才成立,而 XDS
-			 * 这里 delta 是 ~1Hz 的 BLE 通知间隔),导致累计做功被放大约 4×。 */
-			uint32_t acc_inc = ((uint32_t)total_power * delta) / 1000U;
-
 			rx_avg_interval_ms = (rx_avg_interval_ms == 0U) ? delta :
 					      ((rx_avg_interval_ms * 7U) + delta) / 8U;
-			accumulated_power = (uint16_t)(accumulated_power + acc_inc);
 		}
 	}
 	last_rx_packet_ms = now;
+	/* ANT+ BPWR Page 16 按“功率更新事件”累加每次瞬时功率值，不是焦耳积分。 */
+	accumulated_power = (uint16_t)(accumulated_power + total_power);
 	pwr_event_count++;
 	k_mutex_unlock(&data_lock);
-
-	update_ant_from_latest_data();
-	notify_ble_apps_from_cache();
-	last_ant_update_ms = k_uptime_get_32();
 
 	if ((now - last_rx_log_ms) >= RX_LOG_INTERVAL_MS) {
 		SLOG("RX P=%uW C=%urpm E=%u (L=%d R=%d A=%u CA=%u B6=0x%02X)\n",
@@ -734,14 +772,36 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
 	return BT_GATT_ITER_CONTINUE;
 }
 
+static void reject_sensor_connection(struct bt_conn *conn, const char *reason)
+{
+	const bt_addr_le_t *addr = bt_conn_get_dst(conn);
+
+	if (addr != NULL) {
+		bt_addr_le_copy(&rejected_sensor_addr, addr);
+		rejected_sensor_addr_valid = true;
+		rejected_sensor_at_ms = k_uptime_get_32();
+	}
+	ble_sensor_ready = false;
+	LOG_WRN("Rejecting non-XDS/incomplete sensor connection: %s", reason);
+	(void)bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+}
+
 static void subscribe_func(struct bt_conn *conn, uint8_t err,
 			   struct bt_gatt_subscribe_params *params)
 {
-	ARG_UNUSED(conn);
 	ARG_UNUSED(params);
 	if (err) {
 		LOG_ERR("CCCD subscribe write failed (ATT err 0x%02x)", err);
+		reject_sensor_connection(conn, "CCCD write failed");
 	} else {
+		const bt_addr_le_t *addr = bt_conn_get_dst(conn);
+
+		if (addr != NULL) {
+			bt_addr_le_copy(&validated_sensor_addr, addr);
+			validated_sensor_addr_valid = true;
+		}
+		rejected_sensor_addr_valid = false;
+		ble_sensor_ready = true;
 		LOG_INF("CCCD subscribe write OK");
 	}
 }
@@ -754,6 +814,7 @@ static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *at
 	if (!attr) {
 		LOG_WRN("GATT discover finished without full match");
 		(void)memset(params, 0, sizeof(*params));
+		reject_sensor_connection(conn, "required GATT attribute not found");
 		return BT_GATT_ITER_STOP;
 	}
 
@@ -773,6 +834,7 @@ static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *at
 		err = bt_gatt_discover(conn, &discover_params);
 		if (err) {
 			LOG_ERR("Characteristic discover failed (%d)", err);
+			reject_sensor_connection(conn, "characteristic discovery failed");
 		}
 		return BT_GATT_ITER_STOP;
 	}
@@ -780,20 +842,44 @@ static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *at
 	if (params->type == BT_GATT_DISCOVER_CHARACTERISTIC) {
 		const struct bt_gatt_chrc *chrc = attr->user_data;
 
+		if ((chrc->properties & BT_GATT_CHRC_NOTIFY) == 0U) {
+			(void)memset(params, 0, sizeof(*params));
+			reject_sensor_connection(conn, "measurement characteristic is not notifiable");
+			return BT_GATT_ITER_STOP;
+		}
+
+		subscribe_params.value_handle = chrc->value_handle;
+		discover_uuid.uuid.type = BT_UUID_TYPE_16;
+		discover_uuid.val = BT_UUID_GATT_CCC_VAL;
+		discover_params.uuid = &discover_uuid.uuid;
+		discover_params.start_handle = chrc->value_handle + 1U;
+		discover_params.end_handle = service_end_handle;
+		discover_params.type = BT_GATT_DISCOVER_DESCRIPTOR;
+
+		err = bt_gatt_discover(conn, &discover_params);
+		if (err) {
+			LOG_ERR("CCCD discover failed (%d)", err);
+			reject_sensor_connection(conn, "CCCD discovery failed");
+		}
+		return BT_GATT_ITER_STOP;
+	}
+
+	if (params->type == BT_GATT_DISCOVER_DESCRIPTOR) {
 		subscribe_params.notify = notify_func;
 		subscribe_params.subscribe = subscribe_func;
 		subscribe_params.value = BT_GATT_CCC_NOTIFY;
-		subscribe_params.value_handle = chrc->value_handle;
-		subscribe_params.ccc_handle = chrc->value_handle + 1;
+		subscribe_params.ccc_handle = attr->handle;
+		atomic_set_bit(subscribe_params.flags, BT_GATT_SUBSCRIBE_FLAG_VOLATILE);
 
-		LOG_INF("XDS char discovered: handle=0x%04x props=0x%02x ccc=0x%04x",
-			chrc->value_handle, chrc->properties, subscribe_params.ccc_handle);
+		LOG_INF("XDS measurement validated: value=0x%04x ccc=0x%04x",
+			subscribe_params.value_handle, subscribe_params.ccc_handle);
 
 		err = bt_gatt_subscribe(conn, &subscribe_params);
 		if (err && err != -EALREADY) {
 			LOG_ERR("Subscribe failed (%d)", err);
+			reject_sensor_connection(conn, "subscription start failed");
 		} else {
-			LOG_INF("Subscribed to XDS measurement notifications");
+			LOG_INF("XDS subscription requested");
 		}
 
 		(void)memset(params, 0, sizeof(*params));
@@ -870,7 +956,7 @@ static int start_advertising(void)
 		.peer = NULL,
 	};
 
-	if (ble_periph_connected) {
+	if (periph_conn_count >= CONFIG_BT_CTLR_SDC_PERIPHERAL_COUNT) {
 		ble_adv_active = false;
 		return 0;
 	}
@@ -902,6 +988,7 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			 struct net_buf_simple *ad)
 {
 	int err;
+	uint32_t now = k_uptime_get_32();
 	struct bt_conn_le_create_param create_param = BT_CONN_LE_CREATE_PARAM_INIT(
 		BT_CONN_LE_OPT_NONE, BT_GAP_SCAN_FAST_INTERVAL, BT_GAP_SCAN_FAST_INTERVAL);
 	struct bt_le_conn_param conn_param = BT_LE_CONN_PARAM_INIT(
@@ -912,6 +999,19 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 
 	if (sensor_conn || !adv_has_xds_service(ad)) {
 		return;
+	}
+	if (validated_sensor_addr_valid &&
+	    bt_addr_le_cmp(addr, &validated_sensor_addr) != 0) {
+		return;
+	}
+	if (rejected_sensor_addr_valid &&
+	    bt_addr_le_cmp(addr, &rejected_sensor_addr) == 0 &&
+	    (now - rejected_sensor_at_ms) < XDS_REJECT_RETRY_MS) {
+		return;
+	}
+	if (rejected_sensor_addr_valid &&
+	    (now - rejected_sensor_at_ms) >= XDS_REJECT_RETRY_MS) {
+		rejected_sensor_addr_valid = false;
 	}
 
 	ble_seen_sensor = true;
@@ -946,6 +1046,7 @@ static void connected(struct bt_conn *conn, uint8_t err)
 			bt_conn_unref(sensor_conn);
 			sensor_conn = NULL;
 			ble_connected_sensor = false;
+			ble_sensor_ready = false;
 			(void)start_scan();
 		} else {
 			/* 外设侧连接失败时，确保仍可被后续 APP/手表发现。 */
@@ -965,6 +1066,9 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 		xds_scan_active = false;
 		ble_connected_sensor = true;
+		ble_sensor_ready = false;
+		last_ble_data_ms = 0U;
+		last_rx_packet_ms = 0U;
 		LOG_INF("BLE connected to XDS");
 		perr = bt_conn_le_param_update(conn, &xds_param);
 		if (perr && perr != -EALREADY) {
@@ -979,8 +1083,10 @@ static void connected(struct bt_conn *conn, uint8_t err)
 		discover_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
 		discover_params.type = BT_GATT_DISCOVER_PRIMARY;
 
-		if (bt_gatt_discover(conn, &discover_params)) {
-			LOG_ERR("Primary service discover failed");
+		perr = bt_gatt_discover(conn, &discover_params);
+		if (perr) {
+			LOG_ERR("Primary service discover failed (%d)", perr);
+			reject_sensor_connection(conn, "primary service discovery failed");
 		}
 	} else {
 		/* APP/watch connections use tighter parameters for outdoor stability. */
@@ -999,6 +1105,10 @@ static void connected(struct bt_conn *conn, uint8_t err)
 			LOG_WRN("BLE app conn param update failed (%d)", perr);
 		}
 		LOG_INF("BLE app/phone connected to local CPS");
+		if (periph_conn_count < CONFIG_BT_CTLR_SDC_PERIPHERAL_COUNT) {
+			/* Legacy connectable advertising stops after each connection; the main loop restarts it. */
+			last_adv_watchdog_ms = 0U;
+		}
 	}
 }
 
@@ -1016,6 +1126,9 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 
 	if (info.role == BT_CONN_ROLE_CENTRAL) {
 		ble_connected_sensor = false;
+		ble_sensor_ready = false;
+		last_ble_data_ms = 0U;
+		last_rx_packet_ms = 0U;
 		if (sensor_conn) {
 			bt_conn_unref(sensor_conn);
 			sensor_conn = NULL;
@@ -1023,17 +1136,13 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		(void)memset(&subscribe_params, 0, sizeof(subscribe_params));
 		(void)start_scan();
 	} else {
-		/* 多设备连接：仅当最后一个外设断开时才恢复广播，
-		 * 订阅状态由 Zephyr 按 per-connection 自动回收，不在此处统一清除。 */
+		/* 订阅状态由 Zephyr 按 per-connection 自动回收。 */
 		if (periph_conn_count > 0U) {
 			periph_conn_count--;
 		}
 		ble_periph_connected = (periph_conn_count > 0U);
-		if (!ble_periph_connected) {
-			ble_adv_active = false;
-			/* 手机 APP 全部断开后必须立即恢复可连接广播，否则 APP 无法再次连接。 */
-			(void)start_advertising();
-		}
+		ble_adv_active = false;
+		last_adv_watchdog_ms = 0U;
 	}
 }
 
@@ -1050,6 +1159,8 @@ void ant_bpwr_evt_handler(ant_bpwr_profile_t *p_profile, ant_bpwr_evt_t event)
 
 void ant_bpwr_calib_handler(ant_bpwr_profile_t *p_profile, ant_bpwr_page1_data_t *p_page1)
 {
+	bool response_ready = true;
+
 	switch (p_page1->calibration_id) {
 	case ANT_BPWR_CALIB_ID_MANUAL:
 		bpwr.BPWR_PROFILE_calibration_id = ANT_BPWR_CALIB_ID_MANUAL_SUCCESS;
@@ -1071,7 +1182,12 @@ void ant_bpwr_calib_handler(ant_bpwr_profile_t *p_profile, ant_bpwr_page1_data_t
 		       sizeof(bpwr.BPWR_PROFILE_custom_calib_data));
 		break;
 	default:
+		response_ready = false;
 		break;
+	}
+
+	if (response_ready) {
+		ant_bpwr_calib_response(p_profile);
 	}
 }
 
@@ -1080,9 +1196,9 @@ static void ant_evt_handler(ant_evt_t *p_ant_evt)
 	ant_bpwr_sens_evt_handler(p_ant_evt, &bpwr);
 
 	switch (p_ant_evt->event) {
-	case EVENT_CONNECTION_SUCCESS:
 	case EVENT_RX:
 		ant_linked_display = true;
+		last_ant_rx_ms = k_uptime_get_32();
 		break;
 	case EVENT_CONNECTION_FAIL:
 	case EVENT_CONNECTION_TIMEOUT:
@@ -1187,6 +1303,11 @@ static void update_led_pattern(void)
 	bool slow_on = ((now / SLOW_BLINK_HALF_MS) & 0x1U) == 0U;
 	bool ant_led;
 
+	if (ant_linked_display &&
+	    (now - last_ant_rx_ms) >= ANT_DISPLAY_ACTIVITY_TIMEOUT_MS) {
+		ant_linked_display = false;
+	}
+
 	if (!ble_seen_sensor) {
 		set_leds(slow_on, slow_on, ble_periph_connected ? true : slow_on);
 		return;
@@ -1223,7 +1344,7 @@ static void update_ant_from_latest_data(void)
 	uint32_t right_pct;
 
 	k_mutex_lock(&data_lock, K_FOREVER);
-	use_live_data = ble_connected_sensor && ((now - last_ble_data_ms) < DATA_TIMEOUT_MS);
+	use_live_data = ble_sensor_ready && ((now - last_ble_data_ms) < DATA_TIMEOUT_MS);
 	pwr = use_live_data ? latest_power_w : 0U;
 	cad = use_live_data ? latest_cadence : 0U;
 	left_w = use_live_data ? latest_left_power_w : 0;
