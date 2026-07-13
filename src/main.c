@@ -15,9 +15,12 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/uart.h>
+#include <zephyr/drivers/watchdog.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/sys/reboot.h>
 #include <zephyr/sys/util.h>
 
 #include <ant_key_manager.h>
@@ -58,6 +61,14 @@ LOG_MODULE_REGISTER(xds_ant_bridge, LOG_LEVEL_INF);
 #define XDS_REJECT_RETRY_MS 30000
 /** @brief ANT RX 活动多久后不再显示码表在线（ms）。 */
 #define ANT_DISPLAY_ACTIVITY_TIMEOUT_MS 10000
+/** @brief XDS 可接受的最大总功率/单侧功率绝对值（W）。 */
+#define XDS_MAX_POWER_W 3000
+/** @brief 硬件看门狗超时（ms）。 */
+#define WDT_TIMEOUT_MS 5000
+/** @brief 初始化失败后重启前的错误显示时间（ms）。 */
+#define FATAL_REBOOT_DELAY_MS 2000
+/** @brief 无法立即断开异常 XDS 连接时的重试周期（ms）。 */
+#define SENSOR_DISCONNECT_RETRY_MS 1000
 
 /** @brief XDS 功率计服务 UUID（16-bit）。 */
 #define XDS_SERVICE_UUID_16 0x1828
@@ -70,6 +81,8 @@ LOG_MODULE_REGISTER(xds_ant_bridge, LOG_LEVEL_INF);
 #define LED1_NODE DT_ALIAS(led1)
 /** @brief 板载 LED2（P0.04），用于 BLE 外设连接状态指示。 */
 #define LED2_NODE DT_ALIAS(led2)
+/** @brief nRF52840 硬件看门狗。 */
+#define WDT_NODE DT_NODELABEL(wdt0)
 
 /** @brief 串口命令缓冲区长度。 */
 #define CMD_BUF_LEN 64
@@ -79,6 +92,9 @@ LOG_MODULE_REGISTER(xds_ant_bridge, LOG_LEVEL_INF);
 static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(LED1_NODE, gpios);
 static const struct gpio_dt_spec led2 = GPIO_DT_SPEC_GET(LED2_NODE, gpios);
+static const struct device *const wdt_dev = DEVICE_DT_GET(WDT_NODE);
+static int wdt_channel_id = -1;
+static bool leds_initialized;
 
 /** @brief 控制台串口设备。 */
 static const struct device *uart_console;
@@ -103,9 +119,12 @@ static bool serial_log_enabled;
 static uint32_t last_ant_update_ms;
 static uint32_t last_adv_watchdog_ms;
 static uint32_t last_xds_scan_state_ms;
+static uint32_t last_sensor_disconnect_retry_ms;
 
 /** @brief 当前与 XDS 连接对象（中央角色）。 */
 static struct bt_conn *sensor_conn;
+/** @brief 保护 sensor_conn 引用的短临界区锁。 */
+static struct k_spinlock sensor_conn_lock;
 /** @brief GATT 发现参数。 */
 static struct bt_gatt_discover_params discover_params;
 /** @brief GATT 订阅参数。 */
@@ -136,6 +155,8 @@ static int16_t latest_right_power_w;
 static uint16_t latest_cadence;
 /** @brief 最新错误码。 */
 static uint8_t latest_error_code;
+/** @brief 最新数据包是否通过范围与错误码校验。 */
+static bool latest_data_valid;
 /** @brief 最后收到 BLE 数据时间戳（ms）。 */
 static uint32_t last_ble_data_ms;
 /** @brief 上一包 BLE 到达时间戳（ms）。 */
@@ -181,6 +202,62 @@ static uint32_t last_app_notify_ms;
 static uint32_t last_app_log_ms;
 /** @brief 上次 RX 日志时间戳（ms）。 */
 static uint32_t last_rx_log_ms;
+/** @brief 收到新 XDS 包后请求主循环尽快发送 APP 通知。 */
+static atomic_t app_notify_pending;
+/** @brief 收到新 XDS 包后请求主循环异步输出 RX 日志。 */
+static atomic_t rx_log_pending;
+/** @brief bind clear 断开期间禁止当前连接重新完成绑定。 */
+static atomic_t bind_clear_pending;
+/** @brief 当前 XDS 连接需要在主循环中重试断开。 */
+static atomic_t sensor_disconnect_pending;
+
+static bool sensor_conn_exists(void)
+{
+	k_spinlock_key_t key = k_spin_lock(&sensor_conn_lock);
+	bool exists = sensor_conn != NULL;
+
+	k_spin_unlock(&sensor_conn_lock, key);
+	return exists;
+}
+
+static struct bt_conn *sensor_conn_ref_get(void)
+{
+	k_spinlock_key_t key = k_spin_lock(&sensor_conn_lock);
+	struct bt_conn *conn = sensor_conn != NULL ? bt_conn_ref(sensor_conn) : NULL;
+
+	k_spin_unlock(&sensor_conn_lock, key);
+	return conn;
+}
+
+static void sensor_conn_store(struct bt_conn *conn)
+{
+	k_spinlock_key_t key = k_spin_lock(&sensor_conn_lock);
+
+	sensor_conn = conn;
+	k_spin_unlock(&sensor_conn_lock, key);
+}
+
+static struct bt_conn *sensor_conn_take_if(struct bt_conn *expected)
+{
+	k_spinlock_key_t key = k_spin_lock(&sensor_conn_lock);
+	struct bt_conn *conn = NULL;
+
+	if (sensor_conn == expected) {
+		conn = sensor_conn;
+		sensor_conn = NULL;
+	}
+	k_spin_unlock(&sensor_conn_lock, key);
+	return conn;
+}
+
+static bool sensor_conn_matches(struct bt_conn *conn)
+{
+	k_spinlock_key_t key = k_spin_lock(&sensor_conn_lock);
+	bool matches = sensor_conn == conn;
+
+	k_spin_unlock(&sensor_conn_lock, key);
+	return matches;
+}
 
 /**
  * @brief BLE 外设广播数据（放服务与外观）。
@@ -223,6 +300,7 @@ static int start_scan(void);
 static int stop_scan(void);
 static int start_advertising(void);
 static void maintain_ble_links(void);
+static void log_rx_if_due(void);
 static ssize_t read_cps_feature(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 				void *buf, uint16_t len, uint16_t offset);
 static ssize_t read_sensor_location(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -453,7 +531,8 @@ static void notify_ble_apps_from_cache(void)
 	}
 
 	k_mutex_lock(&data_lock, K_FOREVER);
-	use_live_data = ble_sensor_ready && ((now - last_ble_data_ms) < DATA_TIMEOUT_MS);
+	use_live_data = ble_sensor_ready && latest_data_valid &&
+			((now - last_ble_data_ms) < DATA_TIMEOUT_MS);
 	pwr = use_live_data ? latest_power_w : 0U;
 	cad = use_live_data ? latest_cadence : 0U;
 	k_mutex_unlock(&data_lock);
@@ -473,8 +552,10 @@ static void notify_ble_apps_from_cache(void)
 	}
 
 	if (any_notified && (now - last_app_log_ms) >= APP_LOG_INTERVAL_MS) {
-		SLOG("APP TX P=%uW C=%urpm rev=%lu t=%u\n", pwr, cad,
-		     (unsigned long)cumulative_crank_revs, last_crank_event_time_1024);
+		SLOG("APP TX P=%uW C=%urpm rev=%lu t=%u\n",
+		     (unsigned int)pwr, (unsigned int)cad,
+		     (unsigned long)cumulative_crank_revs,
+		     (unsigned int)last_crank_event_time_1024);
 		last_app_log_ms = now;
 	}
 }
@@ -500,11 +581,46 @@ static void notify_ble_apps_if_due(void)
 {
 	uint32_t now = k_uptime_get_32();
 
-	if ((now - last_app_notify_ms) < APP_NOTIFY_INTERVAL_MS) {
+	if (atomic_clear(&app_notify_pending) == 0 &&
+	    (now - last_app_notify_ms) < APP_NOTIFY_INTERVAL_MS) {
 		return;
 	}
 	last_app_notify_ms = now;
 	notify_ble_apps_from_cache();
+}
+
+/**
+ * @brief 在主循环中输出最近一包 RX 数据，避免在 GATT 回调里阻塞 UART。
+ */
+static void log_rx_if_due(void)
+{
+	uint32_t now = k_uptime_get_32();
+	uint16_t pwr;
+	uint16_t cad;
+	int16_t left;
+	int16_t right;
+	uint8_t err;
+	bool valid;
+
+	if (!serial_log_enabled || atomic_get(&rx_log_pending) == 0 ||
+	    (now - last_rx_log_ms) < RX_LOG_INTERVAL_MS) {
+		return;
+	}
+
+	(void)atomic_clear(&rx_log_pending);
+	k_mutex_lock(&data_lock, K_FOREVER);
+	pwr = latest_power_w;
+	cad = latest_cadence;
+	left = latest_left_power_w;
+	right = latest_right_power_w;
+	err = latest_error_code;
+	valid = latest_data_valid;
+	k_mutex_unlock(&data_lock);
+
+	SLOG("RX P=%uW C=%urpm E=%u L=%d R=%d valid=%d\n",
+	     (unsigned int)pwr, (unsigned int)cad, (unsigned int)err,
+	     left, right, valid);
+	last_rx_log_ms = now;
 }
 
 /**
@@ -520,7 +636,28 @@ static void maintain_ble_links(void)
 		(void)start_advertising();
 	}
 
-	if (sensor_conn || ble_connected_sensor) {
+	if (atomic_get(&sensor_disconnect_pending) != 0) {
+		if ((now - last_sensor_disconnect_retry_ms) >= SENSOR_DISCONNECT_RETRY_MS) {
+			struct bt_conn *conn = sensor_conn_ref_get();
+
+			last_sensor_disconnect_retry_ms = now;
+			if (conn != NULL) {
+				int err = bt_conn_disconnect(
+					conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+
+				bt_conn_unref(conn);
+				if (err != 0 && err != -EALREADY) {
+					LOG_WRN("Retry XDS disconnect failed (%d)", err);
+				}
+			} else {
+				atomic_clear(&sensor_disconnect_pending);
+				atomic_clear(&bind_clear_pending);
+			}
+		}
+		return;
+	}
+
+	if (sensor_conn_exists() || ble_connected_sensor) {
 		return;
 	}
 
@@ -545,6 +682,8 @@ static void print_status(void)
 	uint16_t cad;
 	uint8_t err;
 	uint8_t evt;
+	bool ready;
+	bool valid;
 
 	k_mutex_lock(&data_lock, K_FOREVER);
 	if (last_ble_data_ms != 0U) {
@@ -557,14 +696,52 @@ static void print_status(void)
 	cad = latest_cadence;
 	err = latest_error_code;
 	evt = pwr_event_count;
+	ready = ble_sensor_ready;
+	valid = latest_data_valid;
 	k_mutex_unlock(&data_lock);
 
 	/* 持锁期间不要 printf（UART 阻塞会拖慢 BLE 通知回调），先取快照再打印。 */
-	printf("status: seen=%d ble_conn=%d ant_link=%d app=%d adv=%d scan=%d ble_out=%d/%d log=%d pwr=%u cad=%u err=%u evt=%u rate=%u.%uHz age=%ums\n",
-	       ble_seen_sensor, ble_connected_sensor, ant_linked_display,
-	       periph_conn_count, ble_adv_active, xds_scan_active,
+	printf("status: seen=%d ble_conn=%d ready=%d valid=%d ant_link=%d app=%d adv=%d scan=%d ble_out=%d/%d log=%d pwr=%u cad=%u err=%u evt=%u rate=%u.%uHz age=%ums\n",
+	       ble_seen_sensor, ble_connected_sensor, ready, valid,
+	       ant_linked_display, periph_conn_count, ble_adv_active, xds_scan_active,
 	       cps_any_subscribed(), csc_any_subscribed(), serial_log_enabled,
-	       pwr, cad, err, evt, hz_x10 / 10U, hz_x10 % 10U, age_ms);
+	       (unsigned int)pwr, (unsigned int)cad, (unsigned int)err,
+	       (unsigned int)evt, (unsigned int)(hz_x10 / 10U),
+	       (unsigned int)(hz_x10 % 10U), (unsigned int)age_ms);
+}
+
+/**
+ * @brief 清除本次上电的传感器绑定并断开当前 XDS，随后重新扫描。
+ */
+static void clear_sensor_binding(void)
+{
+	struct bt_conn *conn = NULL;
+	int err = 0;
+
+	atomic_set(&bind_clear_pending, 1);
+	k_mutex_lock(&data_lock, K_FOREVER);
+	validated_sensor_addr_valid = false;
+	rejected_sensor_addr_valid = false;
+	latest_data_valid = false;
+	conn = sensor_conn_ref_get();
+	k_mutex_unlock(&data_lock);
+	atomic_set(&app_notify_pending, 1);
+
+	if (conn != NULL) {
+		atomic_set(&sensor_disconnect_pending, 1);
+		err = bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		bt_conn_unref(conn);
+	}
+
+	if (conn == NULL) {
+		atomic_clear(&bind_clear_pending);
+		atomic_clear(&sensor_disconnect_pending);
+		(void)start_scan();
+	} else if (err != 0 && err != -EALREADY) {
+		LOG_WRN("XDS disconnect request failed (%d); retrying", err);
+	}
+
+	printf("sensor binding cleared%s\n", conn != NULL ? "; reconnecting" : "");
 }
 
 /**
@@ -575,7 +752,7 @@ static void print_status(void)
 static void handle_command(const char *cmd)
 {
 	if (strcmp(cmd, "help") == 0) {
-		printf("commands: help, status, scan, log on, log off\n");
+		printf("commands: help, status, scan, bind clear, log on, log off\n");
 		return;
 	}
 	if (strcmp(cmd, "log on") == 0) {
@@ -596,6 +773,10 @@ static void handle_command(const char *cmd)
 		(void)stop_scan();
 		(void)start_scan();
 		printf("scan restart requested\n");
+		return;
+	}
+	if (strcmp(cmd, "bind clear") == 0) {
+		clear_sensor_binding();
 		return;
 	}
 	printf("unknown command: %s\n", cmd);
@@ -689,6 +870,21 @@ static bool adv_has_xds_service(struct net_buf_simple *buf)
 	return matched;
 }
 
+static bool xds_measurement_valid(uint16_t total_power, int16_t left_power,
+				  int16_t right_power, uint8_t err_code)
+{
+	if (err_code != 0U || total_power > XDS_MAX_POWER_W) {
+		return false;
+	}
+
+	if (left_power < -XDS_MAX_POWER_W || left_power > XDS_MAX_POWER_W ||
+	    right_power < -XDS_MAX_POWER_W || right_power > XDS_MAX_POWER_W) {
+		return false;
+	}
+
+	return true;
+}
+
 /**
  * @brief XDS 测量通知回调：解析原始 11 字节数据并更新全局状态。
  *
@@ -702,18 +898,19 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
 	int16_t left_power;
 	int16_t right_power;
 	int8_t raw_cadence_s8;
-	uint8_t raw_cadence_u8;
-	uint16_t angle_deg;
-	uint16_t crank_angle_deg;
 	uint16_t cadence_calc;
 	uint8_t err_code;
 	uint32_t now;
+	bool valid;
 
-	ARG_UNUSED(conn);
 	ARG_UNUSED(params);
 
 	if (!data) {
+		k_mutex_lock(&data_lock, K_FOREVER);
 		ble_sensor_ready = false;
+		latest_data_valid = false;
+		k_mutex_unlock(&data_lock);
+		atomic_set(&app_notify_pending, 1);
 		LOG_WRN("XDS notification subscription was removed; reconnecting");
 		if (conn != NULL) {
 			(void)bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
@@ -721,6 +918,13 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
 		return BT_GATT_ITER_STOP;
 	}
 	if (length < 11) {
+		k_mutex_lock(&data_lock, K_FOREVER);
+		latest_data_valid = false;
+		latest_error_code = 0xFFU;
+		last_ble_data_ms = k_uptime_get_32();
+		k_mutex_unlock(&data_lock);
+		atomic_set(&app_notify_pending, 1);
+		LOG_WRN("Ignoring short XDS measurement (%u bytes)", (unsigned int)length);
 		return BT_GATT_ITER_CONTINUE;
 	}
 
@@ -730,17 +934,15 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
 	right_power = (int16_t)sys_get_le16(raw + 4);
 	/* cpp2026042201.ino: byte6 is signed cadence, reverse pedaling appears as negative. */
 	raw_cadence_s8 = (int8_t)raw[6];
-	raw_cadence_u8 = raw[6];
-	angle_deg = (uint16_t)(sys_get_le16(raw + 6) % 360U);
-	crank_angle_deg = (uint16_t)(sys_get_le16(raw + 8) % 360U);
 	err_code = raw[10];
 	now = k_uptime_get_32();
-	if (raw_cadence_s8 >= 0 && raw_cadence_s8 <= 200) {
+	if (raw_cadence_s8 >= 0) {
 		cadence_calc = (uint16_t)raw_cadence_s8;
 	} else {
 		/* XDS 协议定义 byte6 为有符号值；负值表示反踩，不得回退成高踏频。 */
 		cadence_calc = 0U;
 	}
+	valid = xds_measurement_valid(total_power, left_power, right_power, err_code);
 
 	k_mutex_lock(&data_lock, K_FOREVER);
 	latest_power_w = total_power;
@@ -748,6 +950,7 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
 	latest_right_power_w = right_power;
 	latest_cadence = cadence_calc;
 	latest_error_code = err_code;
+	latest_data_valid = valid;
 	last_ble_data_ms = now;
 	if (last_rx_packet_ms != 0U) {
 		uint32_t delta = now - last_rx_packet_ms;
@@ -758,16 +961,27 @@ static uint8_t notify_func(struct bt_conn *conn, struct bt_gatt_subscribe_params
 		}
 	}
 	last_rx_packet_ms = now;
-	/* ANT+ BPWR Page 16 按“功率更新事件”累加每次瞬时功率值，不是焦耳积分。 */
-	accumulated_power = (uint16_t)(accumulated_power + total_power);
-	pwr_event_count++;
+	if (valid) {
+		const bt_addr_le_t *addr = bt_conn_get_dst(conn);
+
+		/* 只有真实收到合理载荷后才完成本次上电的地址绑定。 */
+		if (addr != NULL && atomic_get(&bind_clear_pending) == 0) {
+			bt_addr_le_copy(&validated_sensor_addr, addr);
+			validated_sensor_addr_valid = true;
+			rejected_sensor_addr_valid = false;
+		}
+		/* ANT+ Page 16 累计的是每个功率更新事件的瞬时功率。 */
+		accumulated_power = (uint16_t)(accumulated_power + total_power);
+		pwr_event_count++;
+	}
 	k_mutex_unlock(&data_lock);
 
-	if ((now - last_rx_log_ms) >= RX_LOG_INTERVAL_MS) {
-		SLOG("RX P=%uW C=%urpm E=%u (L=%d R=%d A=%u CA=%u B6=0x%02X)\n",
-		     total_power, cadence_calc, err_code, left_power, right_power, angle_deg,
-		     crank_angle_deg, raw_cadence_u8);
-		last_rx_log_ms = now;
+	atomic_set(&app_notify_pending, 1);
+	atomic_set(&rx_log_pending, 1);
+	if (!valid) {
+		LOG_WRN("Rejected XDS measurement: P=%u L=%d R=%d err=%u",
+			(unsigned int)total_power, left_power, right_power,
+			(unsigned int)err_code);
 	}
 	return BT_GATT_ITER_CONTINUE;
 }
@@ -776,12 +990,16 @@ static void reject_sensor_connection(struct bt_conn *conn, const char *reason)
 {
 	const bt_addr_le_t *addr = bt_conn_get_dst(conn);
 
+	k_mutex_lock(&data_lock, K_FOREVER);
 	if (addr != NULL) {
 		bt_addr_le_copy(&rejected_sensor_addr, addr);
 		rejected_sensor_addr_valid = true;
 		rejected_sensor_at_ms = k_uptime_get_32();
 	}
 	ble_sensor_ready = false;
+	latest_data_valid = false;
+	k_mutex_unlock(&data_lock);
+	atomic_set(&app_notify_pending, 1);
 	LOG_WRN("Rejecting non-XDS/incomplete sensor connection: %s", reason);
 	(void)bt_conn_disconnect(conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 }
@@ -791,17 +1009,14 @@ static void subscribe_func(struct bt_conn *conn, uint8_t err,
 {
 	ARG_UNUSED(params);
 	if (err) {
-		LOG_ERR("CCCD subscribe write failed (ATT err 0x%02x)", err);
+		LOG_ERR("CCCD subscribe write failed (ATT err 0x%02x)",
+			(unsigned int)err);
 		reject_sensor_connection(conn, "CCCD write failed");
 	} else {
-		const bt_addr_le_t *addr = bt_conn_get_dst(conn);
-
-		if (addr != NULL) {
-			bt_addr_le_copy(&validated_sensor_addr, addr);
-			validated_sensor_addr_valid = true;
-		}
-		rejected_sensor_addr_valid = false;
+		k_mutex_lock(&data_lock, K_FOREVER);
 		ble_sensor_ready = true;
+		latest_data_valid = false;
+		k_mutex_unlock(&data_lock);
 		LOG_INF("CCCD subscribe write OK");
 	}
 }
@@ -872,7 +1087,8 @@ static uint8_t discover_func(struct bt_conn *conn, const struct bt_gatt_attr *at
 		atomic_set_bit(subscribe_params.flags, BT_GATT_SUBSCRIBE_FLAG_VOLATILE);
 
 		LOG_INF("XDS measurement validated: value=0x%04x ccc=0x%04x",
-			subscribe_params.value_handle, subscribe_params.ccc_handle);
+			(unsigned int)subscribe_params.value_handle,
+			(unsigned int)subscribe_params.ccc_handle);
 
 		err = bt_gatt_subscribe(conn, &subscribe_params);
 		if (err && err != -EALREADY) {
@@ -904,7 +1120,7 @@ static int start_scan(void)
 		.window = BT_GAP_SCAN_FAST_WINDOW / 2,
 	};
 
-	if (sensor_conn || ble_connected_sensor) {
+	if (sensor_conn_exists() || ble_connected_sensor) {
 		xds_scan_active = false;
 		return 0;
 	}
@@ -997,22 +1213,26 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 	ARG_UNUSED(rssi);
 	ARG_UNUSED(type);
 
-	if (sensor_conn || !adv_has_xds_service(ad)) {
+	if (sensor_conn_exists() || !adv_has_xds_service(ad)) {
 		return;
 	}
+	k_mutex_lock(&data_lock, K_FOREVER);
 	if (validated_sensor_addr_valid &&
 	    bt_addr_le_cmp(addr, &validated_sensor_addr) != 0) {
+		k_mutex_unlock(&data_lock);
 		return;
 	}
 	if (rejected_sensor_addr_valid &&
 	    bt_addr_le_cmp(addr, &rejected_sensor_addr) == 0 &&
 	    (now - rejected_sensor_at_ms) < XDS_REJECT_RETRY_MS) {
+		k_mutex_unlock(&data_lock);
 		return;
 	}
 	if (rejected_sensor_addr_valid &&
 	    (now - rejected_sensor_at_ms) >= XDS_REJECT_RETRY_MS) {
 		rejected_sensor_addr_valid = false;
 	}
+	k_mutex_unlock(&data_lock);
 
 	ble_seen_sensor = true;
 
@@ -1021,13 +1241,15 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 		return;
 	}
 
-	err = bt_conn_le_create(addr, &create_param, &conn_param, &sensor_conn);
+	struct bt_conn *new_conn = NULL;
+
+	err = bt_conn_le_create(addr, &create_param, &conn_param, &new_conn);
 	if (err) {
 		LOG_ERR("Create conn failed (%d)", err);
-		sensor_conn = NULL;
 		(void)start_scan();
 		return;
 	}
+	sensor_conn_store(new_conn);
 
 	LOG_INF("Connecting to XDS meter (RSSI %d)...", rssi);
 }
@@ -1040,13 +1262,21 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	struct bt_conn_info info;
 
 	if (err) {
-		LOG_ERR("BLE connect failed (%u)", err);
+		struct bt_conn *owned_conn;
+
+		LOG_ERR("BLE connect failed (%u)", (unsigned int)err);
 		/* 仅当失败的是中央侧（连 XDS）对象时，才清理 sensor_conn。 */
-		if (sensor_conn && conn == sensor_conn) {
-			bt_conn_unref(sensor_conn);
-			sensor_conn = NULL;
+		owned_conn = sensor_conn_take_if(conn);
+		if (owned_conn != NULL) {
+			bt_conn_unref(owned_conn);
 			ble_connected_sensor = false;
+			k_mutex_lock(&data_lock, K_FOREVER);
 			ble_sensor_ready = false;
+			latest_data_valid = false;
+			k_mutex_unlock(&data_lock);
+			atomic_set(&app_notify_pending, 1);
+			atomic_clear(&bind_clear_pending);
+			atomic_clear(&sensor_disconnect_pending);
 			(void)start_scan();
 		} else {
 			/* 外设侧连接失败时，确保仍可被后续 APP/手表发现。 */
@@ -1056,6 +1286,24 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	}
 
 	if (bt_conn_get_info(conn, &info) != 0 || info.type != BT_CONN_TYPE_LE) {
+		if (sensor_conn_matches(conn)) {
+			int disconnect_err;
+
+			LOG_ERR("Unable to identify XDS connection role; disconnecting");
+			atomic_set(&sensor_disconnect_pending, 1);
+			disconnect_err = bt_conn_disconnect(
+				conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+			if (disconnect_err != 0 && disconnect_err != -EALREADY) {
+				/*
+				 * 失败不等于连接已经消失。保留唯一引用并等待监督
+				 * 超时/断开回调，避免同时建立第二条中央连接。
+				 */
+				LOG_ERR("XDS disconnect request failed (%d)",
+					disconnect_err);
+			}
+		} else {
+			(void)start_advertising();
+		}
 		return;
 	}
 
@@ -1066,9 +1314,12 @@ static void connected(struct bt_conn *conn, uint8_t err)
 
 		xds_scan_active = false;
 		ble_connected_sensor = true;
+		k_mutex_lock(&data_lock, K_FOREVER);
 		ble_sensor_ready = false;
+		latest_data_valid = false;
 		last_ble_data_ms = 0U;
 		last_rx_packet_ms = 0U;
+		k_mutex_unlock(&data_lock);
 		LOG_INF("BLE connected to XDS");
 		perr = bt_conn_le_param_update(conn, &xds_param);
 		if (perr && perr != -EALREADY) {
@@ -1118,22 +1369,32 @@ static void connected(struct bt_conn *conn, uint8_t err)
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	struct bt_conn_info info;
+	struct bt_conn *owned_conn;
+	bool is_sensor_conn = sensor_conn_matches(conn);
+	int info_err;
 
-	LOG_WRN("BLE disconnected (reason 0x%02x)", reason);
-	if (bt_conn_get_info(conn, &info) != 0 || info.type != BT_CONN_TYPE_LE) {
+	LOG_WRN("BLE disconnected (reason 0x%02x)", (unsigned int)reason);
+	info_err = bt_conn_get_info(conn, &info);
+	if ((info_err != 0 || info.type != BT_CONN_TYPE_LE) && !is_sensor_conn) {
 		return;
 	}
 
-	if (info.role == BT_CONN_ROLE_CENTRAL) {
+	if (is_sensor_conn || (info_err == 0 && info.role == BT_CONN_ROLE_CENTRAL)) {
 		ble_connected_sensor = false;
+		k_mutex_lock(&data_lock, K_FOREVER);
 		ble_sensor_ready = false;
+		latest_data_valid = false;
 		last_ble_data_ms = 0U;
 		last_rx_packet_ms = 0U;
-		if (sensor_conn) {
-			bt_conn_unref(sensor_conn);
-			sensor_conn = NULL;
+		k_mutex_unlock(&data_lock);
+		atomic_set(&app_notify_pending, 1);
+		owned_conn = sensor_conn_take_if(conn);
+		if (owned_conn != NULL) {
+			bt_conn_unref(owned_conn);
 		}
 		(void)memset(&subscribe_params, 0, sizeof(subscribe_params));
+		atomic_clear(&bind_clear_pending);
+		atomic_clear(&sensor_disconnect_pending);
 		(void)start_scan();
 	} else {
 		/* 订阅状态由 Zephyr 按 per-connection 自动回收。 */
@@ -1163,23 +1424,15 @@ void ant_bpwr_calib_handler(ant_bpwr_profile_t *p_profile, ant_bpwr_page1_data_t
 
 	switch (p_page1->calibration_id) {
 	case ANT_BPWR_CALIB_ID_MANUAL:
-		bpwr.BPWR_PROFILE_calibration_id = ANT_BPWR_CALIB_ID_MANUAL_SUCCESS;
-		bpwr.BPWR_PROFILE_general_calib_data = CONFIG_BPWR_TX_CALIBRATION_DATA;
-		break;
 	case ANT_BPWR_CALIB_ID_AUTO:
-		bpwr.BPWR_PROFILE_calibration_id = ANT_BPWR_CALIB_ID_MANUAL_SUCCESS;
-		bpwr.BPWR_PROFILE_auto_zero_status = p_page1->auto_zero_status;
-		bpwr.BPWR_PROFILE_general_calib_data = CONFIG_BPWR_TX_CALIBRATION_DATA;
-		break;
 	case ANT_BPWR_CALIB_ID_CUSTOM_REQ:
-		bpwr.BPWR_PROFILE_calibration_id = ANT_BPWR_CALIB_ID_CUSTOM_REQ_SUCCESS;
-		memcpy(bpwr.BPWR_PROFILE_custom_calib_data, p_page1->data.custom_calib,
-		       sizeof(bpwr.BPWR_PROFILE_custom_calib_data));
-		break;
 	case ANT_BPWR_CALIB_ID_CUSTOM_UPDATE:
-		bpwr.BPWR_PROFILE_calibration_id = ANT_BPWR_CALIB_ID_CUSTOM_UPDATE_SUCCESS;
-		memcpy(bpwr.BPWR_PROFILE_custom_calib_data, p_page1->data.custom_calib,
-		       sizeof(bpwr.BPWR_PROFILE_custom_calib_data));
+		/*
+		 * 桥接器无法把校准请求透传给 XDS。必须明确返回失败，
+		 * 不能让码表误以为真实功率计已经完成校准。
+		 */
+		bpwr.BPWR_PROFILE_calibration_id = ANT_BPWR_CALIB_ID_FAILED;
+		bpwr.BPWR_PROFILE_general_calib_data = 0;
 		break;
 	default:
 		response_ready = false;
@@ -1292,6 +1545,51 @@ static void set_leds(bool l0, bool l1, bool l2)
 	(void)gpio_pin_set_dt(&led2, l2);
 }
 
+static int watchdog_init(void)
+{
+	struct wdt_timeout_cfg timeout_cfg = {
+		.window = {
+			.min = 0U,
+			.max = WDT_TIMEOUT_MS,
+		},
+		.callback = NULL,
+		.flags = WDT_FLAG_RESET_SOC,
+	};
+	int err;
+
+	if (!device_is_ready(wdt_dev)) {
+		LOG_ERR("Watchdog device is not ready");
+		return -ENODEV;
+	}
+
+	wdt_channel_id = wdt_install_timeout(wdt_dev, &timeout_cfg);
+	if (wdt_channel_id < 0) {
+		LOG_ERR("Watchdog timeout install failed (%d)", wdt_channel_id);
+		return wdt_channel_id;
+	}
+
+	err = wdt_setup(wdt_dev, 0);
+	if (err) {
+		LOG_ERR("Watchdog setup failed (%d)", err);
+		wdt_channel_id = -1;
+		return err;
+	}
+
+	return 0;
+}
+
+static void fatal_reboot(const char *stage, int err)
+{
+	LOG_ERR("Fatal initialization failure at %s (%d); rebooting", stage, err);
+	if (leds_initialized) {
+		set_leds(true, false, true);
+	}
+	k_sleep(K_MSEC(FATAL_REBOOT_DELAY_MS));
+	sys_reboot(SYS_REBOOT_COLD);
+
+	CODE_UNREACHABLE;
+}
+
 /**
  * @brief 更新三颗 LED 状态指示。
  *
@@ -1342,9 +1640,11 @@ static void update_ant_from_latest_data(void)
 	bool use_live_data;
 	uint32_t lr_sum;
 	uint32_t right_pct;
+	unsigned int irq_key;
 
 	k_mutex_lock(&data_lock, K_FOREVER);
-	use_live_data = ble_sensor_ready && ((now - last_ble_data_ms) < DATA_TIMEOUT_MS);
+	use_live_data = ble_sensor_ready && latest_data_valid &&
+			((now - last_ble_data_ms) < DATA_TIMEOUT_MS);
 	pwr = use_live_data ? latest_power_w : 0U;
 	cad = use_live_data ? latest_cadence : 0U;
 	left_w = use_live_data ? latest_left_power_w : 0;
@@ -1353,6 +1653,8 @@ static void update_ant_from_latest_data(void)
 	acc = accumulated_power;
 	k_mutex_unlock(&data_lock);
 
+	/* ANT 事件可异步读取 profile；短临界区保证整页字段来自同一快照。 */
+	irq_key = irq_lock();
 	bpwr.BPWR_PROFILE_instantaneous_power = pwr;
 	/* Forward parsed cadence to ANT+ (0xFF is reserved as invalid). */
 	bpwr.BPWR_PROFILE_instantaneous_cadence = (cad > 254U) ? 254U : (uint8_t)cad;
@@ -1373,6 +1675,7 @@ static void update_ant_from_latest_data(void)
 	}
 	bpwr.BPWR_PROFILE_power_update_event_count = evt;
 	bpwr.BPWR_PROFILE_accumulated_power = acc;
+	irq_unlock(irq_key);
 }
 
 /**
@@ -1385,24 +1688,31 @@ int main(void)
 	k_mutex_init(&data_lock);
 	uart_console = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
 
-	if (leds_init() < 0) {
-		return 0;
+	err = leds_init();
+	if (err) {
+		fatal_reboot("LED", err);
+	}
+	leds_initialized = true;
+
+	err = watchdog_init();
+	if (err) {
+		fatal_reboot("watchdog", err);
 	}
 
 	err = ant_stack_setup();
 	if (err) {
-		return 0;
+		fatal_reboot("ANT stack", err);
 	}
 
 	err = profile_setup();
 	if (err) {
-		return 0;
+		fatal_reboot("ANT profile", err);
 	}
 
 	err = bt_enable(NULL);
 	if (err) {
 		LOG_ERR("Bluetooth init failed (%d)", err);
-		return 0;
+		fatal_reboot("Bluetooth", err);
 	}
 
 	err = start_advertising();
@@ -1423,7 +1733,12 @@ int main(void)
 		maintain_ble_links();
 		notify_ble_apps_if_due();
 		ant_update_if_due();
+		log_rx_if_due();
 		update_led_pattern();
+		err = wdt_feed(wdt_dev, wdt_channel_id);
+		if (err) {
+			LOG_ERR("Watchdog feed failed (%d)", err);
+		}
 		k_sleep(K_MSEC(MAIN_LOOP_MS));
 	}
 
