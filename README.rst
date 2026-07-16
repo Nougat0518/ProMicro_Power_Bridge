@@ -1,4 +1,4 @@
-﻿ProMicro_Power_Bridge
+ProMicro_Power_Bridge
 ######################
 
 XDS BLE to ANT+ Bicycle Power and BLE CPS/CSCS bridge for nRF52840 boards with
@@ -31,6 +31,18 @@ position or an authoritative lifetime revolution counter.
 ANT calibration requests are reported as failed because this bridge cannot
 forward calibration operations to the underlying XDS sensor. Calibrate the XDS
 sensor using its native interface instead.
+
+Battery Voltage Calibration
+***************************
+
+P0.04 (AIN2) samples the ``BVOLT`` divider. The fixed divider scale is
+``2000/1000`` for a 100 kΩ resistor from BAT to P0.04 and a 100 kΩ resistor
+from P0.04 to GND. At 4.2 V battery voltage, the ADC pin voltage is about
+2.1 V. Adjust ``BATTERY_SCALE_PERMILLE`` in ``src/main.c`` only if a
+multimeter comparison shows a consistent offset.
+
+Battery voltage is printed once per second by default. The ``vbat`` command
+prints one sample; ``vbat on`` and ``vbat off`` control periodic output.
 
 Building and Running
 ********************

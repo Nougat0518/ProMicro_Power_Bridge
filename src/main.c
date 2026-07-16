@@ -13,6 +13,7 @@
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/device.h>
+#include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/uart.h>
 #include <zephyr/drivers/watchdog.h>
@@ -69,23 +70,32 @@ LOG_MODULE_REGISTER(xds_ant_bridge, LOG_LEVEL_INF);
 #define FATAL_REBOOT_DELAY_MS 2000
 /** @brief 无法立即断开异常 XDS 连接时的重试周期（ms）。 */
 #define SENSOR_DISCONNECT_RETRY_MS 1000
-
+/** @brief 电池电压采样周期（ms）。 */
+#define BATTERY_SAMPLE_INTERVAL_MS 1000
+/** @brief 低电量 LED 阈值（mV）。 */
+#define BATTERY_LOW_THRESHOLD_MV 3600
+/** @brief 100kΩ + 100kΩ 分压器的电池电压还原系数（千分比）。 */
+#define BATTERY_SCALE_PERMILLE 2000U
 /** @brief XDS 功率计服务 UUID（16-bit）。 */
 #define XDS_SERVICE_UUID_16 0x1828
 /** @brief XDS 功率计测量特征 UUID（16-bit）。 */
 #define XDS_MEAS_UUID_16 0x2A63
 
-/** @brief 板载 LED0（P0.12）。 */
+/** @brief 板载 LED0。 */
 #define LED0_NODE DT_ALIAS(led0)
-/** @brief 板载 LED1（P1.09）。 */
+/** @brief 板载 LED1。 */
 #define LED1_NODE DT_ALIAS(led1)
-/** @brief 板载 LED2（P0.04），用于 BLE 外设连接状态指示。 */
+/** @brief 板载 LED2，用于低电量状态指示。 */
 #define LED2_NODE DT_ALIAS(led2)
 /** @brief nRF52840 硬件看门狗。 */
 #define WDT_NODE DT_NODELABEL(wdt0)
+/** @brief P0.04/AIN2 电池分压采样通道。 */
+#define BATTERY_ADC_NODE DT_PATH(zephyr_user)
 
 /** @brief 串口命令缓冲区长度。 */
 #define CMD_BUF_LEN 64
+/** @brief 每轮主循环最多处理的串口字节数，避免持续输入饿死看门狗。 */
+#define UART_RX_BUDGET 64
 /** @brief 无换行命令的自动执行空闲时间（ms）。 */
 #define CMD_IDLE_EXEC_MS 1200
 
@@ -93,8 +103,17 @@ static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(LED1_NODE, gpios);
 static const struct gpio_dt_spec led2 = GPIO_DT_SPEC_GET(LED2_NODE, gpios);
 static const struct device *const wdt_dev = DEVICE_DT_GET(WDT_NODE);
+static const struct adc_dt_spec battery_adc = ADC_DT_SPEC_GET(BATTERY_ADC_NODE);
 static int wdt_channel_id = -1;
 static bool leds_initialized;
+static bool battery_adc_ready;
+static bool battery_adc_calibrated;
+static bool battery_log_enabled = true;
+static uint32_t last_battery_sample_ms;
+static int16_t latest_battery_raw;
+static int32_t latest_battery_pin_mv;
+static int32_t latest_battery_mv;
+static bool battery_voltage_valid;
 
 /** @brief 控制台串口设备。 */
 static const struct device *uart_console;
@@ -180,8 +199,6 @@ static bool ble_seen_sensor;
 static bool ble_connected_sensor;
 /** @brief XDS 测量特征已成功订阅，可以使用本连接的数据。 */
 static bool ble_sensor_ready;
-/** @brief 是否有手机 APP 连接到本机外设。 */
-static bool ble_periph_connected;
 static bool ble_adv_active;
 static bool xds_scan_active;
 /** @brief 是否检测到 ANT 码表已链路建立。 */
@@ -671,6 +688,103 @@ static void maintain_ble_links(void)
 	}
 }
 
+static int battery_adc_init(void)
+{
+	int err;
+
+	if (!adc_is_ready_dt(&battery_adc)) {
+		LOG_ERR("Battery ADC is not ready");
+		return -ENODEV;
+	}
+
+	err = adc_channel_setup_dt(&battery_adc);
+	if (err) {
+		LOG_ERR("Battery ADC channel setup failed (%d)", err);
+		return err;
+	}
+
+	battery_adc_ready = true;
+	return 0;
+}
+
+static int sample_battery_voltage(void)
+{
+	int16_t raw;
+	int32_t pin_mv;
+	struct adc_sequence sequence = {
+		.buffer = &raw,
+		.buffer_size = sizeof(raw),
+	};
+	int err;
+
+	battery_voltage_valid = false;
+	if (!battery_adc_ready) {
+		return -ENODEV;
+	}
+
+	err = adc_sequence_init_dt(&battery_adc, &sequence);
+	if (err) {
+		return err;
+	}
+	sequence.calibrate = !battery_adc_calibrated;
+
+	err = adc_read_dt(&battery_adc, &sequence);
+	if (err) {
+		return err;
+	}
+	battery_adc_calibrated = true;
+
+	pin_mv = raw;
+	err = adc_raw_to_millivolts_dt(&battery_adc, &pin_mv);
+	if (err) {
+		return err;
+	}
+
+	latest_battery_raw = raw;
+	latest_battery_pin_mv = pin_mv;
+	latest_battery_mv = (int32_t)(((int64_t)pin_mv * BATTERY_SCALE_PERMILLE + 500) / 1000);
+	battery_voltage_valid = true;
+	return 0;
+}
+
+static void print_battery_sample(void)
+{
+	printf("VBAT raw=%d pin=%dmV battery=%dmV scale=%u/1000\n",
+	       latest_battery_raw, latest_battery_pin_mv, latest_battery_mv,
+	       (unsigned int)BATTERY_SCALE_PERMILLE);
+}
+
+static void print_battery_voltage(void)
+{
+	int err = sample_battery_voltage();
+
+	if (err) {
+		printf("VBAT ADC error: %d\n", err);
+		return;
+	}
+	print_battery_sample();
+}
+
+static void update_battery_if_due(void)
+{
+	uint32_t now = k_uptime_get_32();
+	int err;
+
+	if ((now - last_battery_sample_ms) < BATTERY_SAMPLE_INTERVAL_MS) {
+		return;
+	}
+
+	last_battery_sample_ms = now;
+	err = sample_battery_voltage();
+	if (battery_log_enabled) {
+		if (err) {
+			printf("VBAT ADC error: %d\n", err);
+		} else {
+			print_battery_sample();
+		}
+	}
+}
+
 /**
  * @brief 打印当前桥接状态（串口命令 status）。
  */
@@ -752,7 +866,7 @@ static void clear_sensor_binding(void)
 static void handle_command(const char *cmd)
 {
 	if (strcmp(cmd, "help") == 0) {
-		printf("commands: help, status, scan, bind clear, log on, log off\n");
+		printf("commands: help, status, scan, bind clear, vbat, vbat on/off, log on/off\n");
 		return;
 	}
 	if (strcmp(cmd, "log on") == 0) {
@@ -779,6 +893,21 @@ static void handle_command(const char *cmd)
 		clear_sensor_binding();
 		return;
 	}
+	if (strcmp(cmd, "vbat") == 0) {
+		print_battery_voltage();
+		return;
+	}
+	if (strcmp(cmd, "vbat on") == 0) {
+		battery_log_enabled = true;
+		last_battery_sample_ms = 0U;
+		printf("VBAT periodic output enabled\n");
+		return;
+	}
+	if (strcmp(cmd, "vbat off") == 0) {
+		battery_log_enabled = false;
+		printf("VBAT periodic output disabled\n");
+		return;
+	}
 	printf("unknown command: %s\n", cmd);
 }
 
@@ -803,12 +932,15 @@ static void poll_uart_commands(void)
 {
 	unsigned char c;
 	uint32_t now = k_uptime_get_32();
+	size_t bytes_read = 0U;
 
 	if (!uart_console) {
 		return;
 	}
 
-	while (uart_poll_in(uart_console, &c) == 0) {
+	while (bytes_read < UART_RX_BUDGET &&
+	       uart_poll_in(uart_console, &c) == 0) {
+		bytes_read++;
 		cmd_last_rx_ms = now;
 		if (c == '\r' || c == '\n') {
 			execute_pending_command();
@@ -1347,7 +1479,6 @@ static void connected(struct bt_conn *conn, uint8_t err)
 					      BT_GAP_MS_TO_CONN_TIMEOUT(APP_CONN_TIMEOUT_MS));
 		int perr;
 
-		ble_periph_connected = true;
 		periph_conn_count++;
 		ble_adv_active = false;
 		last_crank_update_ms = k_uptime_get_32();
@@ -1401,7 +1532,6 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		if (periph_conn_count > 0U) {
 			periph_conn_count--;
 		}
-		ble_periph_connected = (periph_conn_count > 0U);
 		ble_adv_active = false;
 		last_adv_watchdog_ms = 0U;
 	}
@@ -1593,27 +1723,25 @@ static void fatal_reboot(const char *stage, int err)
 /**
  * @brief 更新三颗 LED 状态指示。
  *
- * LED2(P0.04): APP 已连接常亮，否则慢闪。
+ * LED0: 未发现 XDS 时慢闪，发现后熄灭。
+ * LED1: 无近期 ANT 接收活动时慢闪，有活动后熄灭；10 秒无消息后恢复慢闪。
+ * LED2: 电池低于 3.6V 时慢闪，否则熄灭。
  */
 static void update_led_pattern(void)
 {
 	uint32_t now = k_uptime_get_32();
 	bool slow_on = ((now / SLOW_BLINK_HALF_MS) & 0x1U) == 0U;
-	bool ant_led;
+	bool low_battery = battery_voltage_valid &&
+			   latest_battery_mv < BATTERY_LOW_THRESHOLD_MV;
 
 	if (ant_linked_display &&
 	    (now - last_ant_rx_ms) >= ANT_DISPLAY_ACTIVITY_TIMEOUT_MS) {
 		ant_linked_display = false;
 	}
 
-	if (!ble_seen_sensor) {
-		set_leds(slow_on, slow_on, ble_periph_connected ? true : slow_on);
-		return;
-	}
-
-	/* LED1: blink while ANT display (bike computer) is not linked, solid on when linked. */
-	ant_led = ant_linked_display ? true : slow_on;
-	set_leds(true, ant_led, ble_periph_connected ? true : slow_on);
+	set_leds(ble_seen_sensor ? false : slow_on,
+		 ant_linked_display ? false : slow_on,
+		 low_battery ? slow_on : false);
 }
 
 /**
@@ -1694,6 +1822,11 @@ int main(void)
 	}
 	leds_initialized = true;
 
+	err = battery_adc_init();
+	if (err) {
+		LOG_WRN("Continue without battery voltage measurement");
+	}
+
 	err = watchdog_init();
 	if (err) {
 		fatal_reboot("watchdog", err);
@@ -1734,6 +1867,7 @@ int main(void)
 		notify_ble_apps_if_due();
 		ant_update_if_due();
 		log_rx_if_due();
+		update_battery_if_due();
 		update_led_pattern();
 		err = wdt_feed(wdt_dev, wdt_channel_id);
 		if (err) {
